@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        # No npm dependencies needed (pure Node.js + OpenClaw CLI)
+        echo "No dependencies to install"
+    
+    - name: Validate JavaScript
+      run: |
+        node --check bin/orchestrator.js
+        node --check lib/state.js
+        node --check lib/phases.js
+    
+    - name: Test state module
+      run: |
+        node -e "const state = require('./lib/state'); console.log('State module OK')"
+    
+    - name: Test phases module
+      run: |
+        node -e "const phases = require('./lib/phases'); console.log('Phases module OK, loaded ' + Object.keys(phases.phases).length + ' phases')"
+    
+    - name: Verify workflow state
+      run: |
+        node -e "const state = require('./lib/state'); const s = state.loadState(); console.log('Workflow state loaded:', s.status)"
