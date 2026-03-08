@@ -1,18 +1,9 @@
 {
-  "projectId": null,
-  "projectName": null,
-  "status": "idle",
-  "currentPhase": 0,
-  "completedPhases": [],
-  "activeSubagent": null,
-  "subagentRunId": null,
+  "currentPhase": null,
+  "project": null,
+  "activeAgent": null,
+  "artifacts": [],
+  "githubIssue": null,
   "startedAt": null,
-  "lastUpdate": null,
-  "artifacts": {},
-  "errors": [],
-  "config": {
-    "heartbeatInterval": 30000,
-    "maxRetries": 2,
-    "baseTimeout": 120000
-  }
+  "lastUpdated": "2026-03-08T12:50:00+01:00"
 }

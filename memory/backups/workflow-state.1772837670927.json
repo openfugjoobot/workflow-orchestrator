@@ -1,0 +1,18 @@
+{
+  "projectId": null,
+  "projectName": null,
+  "status": "idle",
+  "currentPhase": 0,
+  "completedPhases": [],
+  "activeSubagent": null,
+  "subagentRunId": null,
+  "startedAt": null,
+  "lastUpdate": null,
+  "artifacts": {},
+  "errors": [],
+  "config": {
+    "heartbeatInterval": 30000,
+    "maxRetries": 2,
+    "baseTimeout": 120000
+  }
+}

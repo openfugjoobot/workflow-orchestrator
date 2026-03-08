@@ -1,329 +1,271 @@
 #!/usr/bin/env node
 /**
- * Workflow Orchestrator - Main Entry Point
+ * Workflow Orchestrator - Check & Advance
  * 
- * Usage:
- *   node orchestrator.js start <projectName>
- *   node orchestrator.js status
- *   node orchestrator.js pause
- *   node orchestrator.js resume
- *   node orchestrator.js cancel
+ * Called by Heartbeat to check workflow progress and advance phases.
+ * Uses sessions_list API to check subagent status.
  */
 
+const fs = require('fs');
+const path = require('path');
 const { execSync } = require('child_process');
-const state = require('./lib/state');
-const phases = require('./lib/phases');
+const state = require('../lib/state');
+const phases = require('../lib/phases');
+const spawn = require('../lib/spawn');
 
-const PROJECT_WORKSPACE = process.env.PROJECT_WORKSPACE || '/home/ubuntu/.openclaw/workspace';
+const STATE_PATH = state.STATE_PATH;
 
 /**
- * Execute OpenClaw command
+ * Run OpenClaw CLI command and parse JSON output
  */
-function openclaw(args) {
+function runOpenClawCmd(args) {
   try {
-    const result = execSync(`openclaw ${args}`, {
-      encoding: 'utf8',
-      cwd: PROJECT_WORKSPACE,
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    return { ok: true, output: result };
+    const cmd = `openclaw ${args.join(' ')} --json 2>/dev/null`;
+    const output = execSync(cmd, { encoding: 'utf8' });
+    return JSON.parse(output);
   } catch (err) {
-    return { 
-      ok: false, 
-      error: err.message,
-      stdout: err.stdout,
-      stderr: err.stderr
-    };
-  }
-}
-
-/**
- * Spawn a subagent
- */
-function spawnSubagent(agentId, task, timeout) {
-  console.log(`Spawning ${agentId}...`);
-  
-  const sessionLabel = `workflow-${Date.now()}`;
-  
-  // Use sessions_spawn via openclaw
-  const result = openclaw(`sessions_spawn --agent ${agentId} --label ${sessionLabel} --mode run --runtime subagent --timeout ${timeout/1000} --task "${task.replace(/"/g, '\\"')}"`);
-  
-  if (!result.ok) {
-    console.error('Failed to spawn subagent:', result.error);
-    return null;
-  }
-  
-  // Parse output to extract sessionKey and runId
-  // Output format: {"status":"accepted","sessionKey":"...","runId":"..."}
-  try {
-    const json = JSON.parse(result.output);
-    return {
-      sessionKey: json.sessionKey || json.childSessionKey,
-      runId: json.runId
-    };
-  } catch (e) {
-    console.error('Failed to parse spawn response:', result.output);
     return null;
   }
 }
 
 /**
- * Check subagent status
+ * Read subagent status from sessions_list API
  */
-function checkSubagent(sessionKey) {
-  const result = openclaw(`subagents list --recent-minutes 60`);
-  
-  if (!result.ok) {
-    return { status: 'unknown', error: result.error };
-  }
-  
+function getSubagentStatus(sessionKey) {
   try {
-    const json = JSON.parse(result.output);
-    const active = json.active || [];
-    const recent = json.recent || [];
+    const result = runOpenClawCmd(['sessions', 'list', '--limit', '50']);
     
-    // Check if our session is active
-    const activeMatch = active.find(a => a.sessionKey === sessionKey);
-    if (activeMatch) {
-      return { status: 'running', runtime: activeMatch.runtime };
+    if (!result || !result.sessions) {
+      return { status: 'api_error' };
     }
     
-    // Check if recently completed
-    const recentMatch = recent.find(r => r.sessionKey === sessionKey);
-    if (recentMatch) {
+    // Find our subagent session
+    const session = result.sessions.find(s => s.key === sessionKey || s.sessionKey === sessionKey);
+    
+    if (!session) {
+      return { status: 'not_found' };
+    }
+    
+    // Check if session completed
+    if (session.status === 'completed' || session.endedAt || session.state === 'idle') {
       return { 
-        status: recentMatch.status, 
-        runtime: recentMatch.runtime,
-        tokens: recentMatch.totalTokens
+        status: 'done',
+        tokens: session.totalTokens || session.usage?.totalTokens,
+        exitCode: session.exitCode
       };
     }
     
-    return { status: 'not_found' };
-  } catch (e) {
-    return { status: 'parse_error', error: e.message };
-  }
-}
-
-/**
- * Start new workflow
- */
-function startWorkflow(projectName, options = {}) {
-  console.log(`Starting workflow for: ${projectName}`);
-  
-  // Check if workflow already running
-  const existingState = state.loadState();
-  if (existingState && existingState.status === 'running') {
-    console.log('Workflow already running. Use --force to restart.');
-    return { ok: false, error: 'Workflow already in progress' };
-  }
-  
-  // Create initial state
-  const initialState = state.createInitialState(projectName, options);
-  state.saveState(initialState);
-  
-  console.log(`Workflow ID: ${initialState.projectId}`);
-  console.log(`Starting Phase 0: ${phases.getPhase(0).name}`);
-  
-  // Spawn Phase 0
-  const phase = phases.getPhase(0);
-  const task = phase.taskTemplate({ projectName, ...options });
-  
-  const subagent = spawnSubagent(phase.agentId, task, phase.timeout);
-  
-  if (!subagent) {
-    state.addError(initialState, 'Failed to spawn Phase 0 subagent');
-    return { ok: false, error: 'Failed to spawn subagent' };
-  }
-  
-  state.setActiveSubagent(initialState, subagent.sessionKey, subagent.runId);
-  
-  console.log(`Subagent spawned: ${subagent.sessionKey}`);
-  console.log('Workflow started. Run "status" to check progress.');
-  
-  return { ok: true, state: initialState };
-}
-
-/**
- * Show workflow status
- */
-function showStatus() {
-  const st = state.loadState();
-  
-  if (!st) {
-    console.log('No active workflow found.');
-    return;
-  }
-  
-  const currentPhase = phases.getPhase(st.currentPhase);
-  
-  console.log(`\nWorkflow: ${st.projectName}`);
-  console.log(`Status: ${st.status}`);
-  console.log(`Current Phase: ${st.currentPhase} - ${currentPhase?.name || 'COMPLETE'}`);
-  console.log(`Active Subagent: ${st.activeSubagent || 'none'}`);
-  console.log(`Completed Phases: ${st.completedPhases.join(', ') || 'none'}`);
-  console.log(`Artifacts: ${Object.keys(st.artifacts).length}`);
-  
-  if (st.activeSubagent) {
-    const subagentStatus = checkSubagent(st.activeSubagent);
-    console.log(`Subagent Status: ${subagentStatus.status}`);
-    if (subagentStatus.runtime) {
-      console.log(`Runtime: ${subagentStatus.runtime}`);
+    // Check for timeout or failure
+    if (session.status === 'failed' || session.exitCode !== 0) {
+      return { 
+        status: 'failed',
+        exitCode: session.exitCode,
+        error: session.error 
+      };
     }
-  }
-  
-  if (st.errors.length > 0) {
-    console.log(`\nErrors: ${st.errors.length}`);
-    st.errors.forEach((e, i) => {
-      console.log(`  ${i+1}. [${e.timestamp}] Phase ${e.phase}: ${e.error}`);
-    });
+    
+    return { status: 'running' };
+    
+  } catch (err) {
+    return { status: 'error', error: err.message };
   }
 }
 
 /**
- * Check and advance workflow
+ * Check and advance workflow with retry logic and parallel execution support
  */
 function checkAndAdvance() {
   const st = state.loadState();
   
-  if (!st || st.status !== 'running') {
-    console.log('No active workflow to check.');
-    return;
+  if (!st) {
+    return { ok: false, message: 'No workflow state found' };
   }
   
-  if (!st.activeSubagent) {
-    console.log('No active subagent. Workflow may need manual intervention.');
-    return;
+  if (st.status !== 'running') {
+    return { ok: false, message: `Workflow not running: ${st.status}` };
   }
   
-  console.log('Checking subagent status...');
-  const subagentStatus = checkSubagent(st.activeSubagent);
+  const phaseConfig = phases.getPhase(st.currentPhase);
+  const retryCount = st.retryCount || 0;
+  const maxRetries = st.config?.maxRetries || 2;
   
-  console.log(`Subagent status: ${subagentStatus.status}`);
-  
-  if (subagentStatus.status === 'done' || subagentStatus.status === 'timeout') {
-    console.log(`Phase ${st.currentPhase} completed.`);
+  // Check for parallel phase completion
+  if (st.parallelPhase && st.activeSubagents) {
+    const parallelStatus = spawn.checkParallelCompletion(st);
     
-    // Advance to next phase
-    const oldPhase = phases.getPhase(st.currentPhase);
+    if (parallelStatus && parallelStatus.allDone) {
+      console.log(`✅ Phase ${st.currentPhase} (${phaseConfig?.name}) completed (parallel agents done)`);
+      
+      if (st.retryCount) st.retryCount = 0;
+      
+      const oldPhase = st.currentPhase;
+      state.advancePhase(st);
+      
+      if (st.currentPhase > 8) {
+        console.log('🎉 Workflow COMPLETED!');
+        return { ok: true, status: 'completed', phase: 8 };
+      }
+      
+      // Auto-spawn next phase
+      const nextPhaseConfig = phases.getPhase(st.currentPhase);
+      console.log(`➡️ Advancing to Phase ${st.currentPhase}: ${nextPhaseConfig?.name}`);
+      
+      const parallelAgents = nextPhaseConfig.parallelAgents || null;
+      const spawnResult = spawn.spawnPhaseAgent(st, st.currentPhase, parallelAgents);
+      
+      if (!spawnResult.ok) {
+        console.error(`❌ Failed to spawn Phase ${st.currentPhase}`);
+        state.addError(st, {
+          type: 'spawn_failure',
+          phase: st.currentPhase,
+          error: spawnResult.error
+        });
+        return { 
+          ok: false, 
+          status: 'spawn_failed',
+          fromPhase: oldPhase,
+          toPhase: st.currentPhase,
+          error: spawnResult.error
+        };
+      }
+      
+      console.log(`🚀 Spawned ${spawnResult.parallel ? 'parallel agents' : 'agent'}: ${spawnResult.sessions.map(s => s.agentId).join(', ')}`);
+      
+      return { 
+        ok: true, 
+        status: 'spawned',
+        fromPhase: oldPhase,
+        toPhase: st.currentPhase,
+        sessions: spawnResult.sessions,
+        parallel: spawnResult.parallel
+      };
+    }
+    
+    if (parallelStatus && parallelStatus.anyFailed) {
+      if (retryCount < maxRetries) {
+        st.retryCount = retryCount + 1;
+        state.saveState(st);
+        console.log(`⚠️ Parallel agents failed (attempt ${retryCount + 1}/${maxRetries + 1}), retrying...`);
+        return { ok: true, status: 'retry', phase: st.currentPhase, retryCount: st.retryCount };
+      }
+      console.log(`❌ Phase ${st.currentPhase} failed after ${maxRetries + 1} attempts`);
+      state.addError(st, { type: 'parallel_failure', phase: st.currentPhase });
+      return { ok: false, status: 'failed', phase: st.currentPhase };
+    }
+    
+    return { ok: true, status: 'running', phase: st.currentPhase, phaseName: phaseConfig?.name, parallel: true };
+  }
+  
+  // Single agent mode
+  if (!st.activeSubagent) {
+    return { ok: false, message: 'No active subagent' };
+  }
+  
+  const subagentStatus = getSubagentStatus(st.activeSubagent);
+  
+  // Handle completion
+  if (subagentStatus.status === 'done') {
+    console.log(`✅ Phase ${st.currentPhase} (${phaseConfig?.name}) completed`);
+    
+    // Reset retry count on success
+    if (st.retryCount) {
+      st.retryCount = 0;
+    }
+    
+    const oldPhase = st.currentPhase;
     state.advancePhase(st);
     
     if (st.currentPhase > 8) {
-      console.log('🎉 Workflow completed!');
-      return;
+      console.log('🎉 Workflow COMPLETED!');
+      return { ok: true, status: 'completed', phase: 8 };
     }
     
-    const newPhase = phases.getPhase(st.currentPhase);
-    console.log(`Starting Phase ${st.currentPhase}: ${newPhase.name}`);
+    // Auto-spawn next phase
+    const nextPhaseConfig = phases.getPhase(st.currentPhase);
+    console.log(`➡️ Advancing to Phase ${st.currentPhase}: ${nextPhaseConfig?.name}`);
     
-    const task = newPhase.taskTemplate({ 
-      projectName: st.projectName 
+    // Determine if parallel execution needed
+    const parallelAgents = nextPhaseConfig.parallelAgents || null;
+    
+    const spawnResult = spawn.spawnPhaseAgent(st, st.currentPhase, parallelAgents);
+    
+    if (!spawnResult.ok) {
+      console.error(`❌ Failed to spawn Phase ${st.currentPhase}`);
+      state.addError(st, {
+        type: 'spawn_failure',
+        phase: st.currentPhase,
+        error: spawnResult.error
+      });
+      return { 
+        ok: false, 
+        status: 'spawn_failed',
+        fromPhase: oldPhase,
+        toPhase: st.currentPhase,
+        error: spawnResult.error
+      };
+    }
+    
+    console.log(`🚀 Spawned ${spawnResult.parallel ? 'parallel agents' : 'agent'}: ${spawnResult.sessions.map(s => s.agentId).join(', ')}`);
+    
+    return { 
+      ok: true, 
+      status: 'spawned',
+      fromPhase: oldPhase,
+      toPhase: st.currentPhase,
+      sessions: spawnResult.sessions,
+      parallel: spawnResult.parallel
+    };
+    
+  } else if (subagentStatus.status === 'failed') {
+    // Retry logic
+    if (retryCount < maxRetries) {
+      st.retryCount = retryCount + 1;
+      state.saveState(st);
+      console.log(`⚠️ Subagent failed (attempt ${retryCount + 1}/${maxRetries + 1}), retrying...`);
+      return { 
+        ok: true, 
+        status: 'retry',
+        phase: st.currentPhase,
+        retryCount: st.retryCount
+      };
+    }
+    
+    // Max retries exceeded
+    console.log(`❌ Phase ${st.currentPhase} failed after ${maxRetries + 1} attempts`);
+    state.addError(st, {
+      type: 'subagent_failure',
+      phase: st.currentPhase,
+      error: subagentStatus.error,
+      retries: retryCount + 1
     });
-    
-    const subagent = spawnSubagent(newPhase.agentId, task, newPhase.timeout);
-    
-    if (!subagent) {
-      state.addError(st, `Failed to spawn Phase ${st.currentPhase} subagent`);
-      console.error('Failed to spawn subagent for next phase.');
-      return;
-    }
-    
-    state.setActiveSubagent(st, subagent.sessionKey, subagent.runId);
-    console.log(`Subagent spawned: ${subagent.sessionKey}`);
+    return { 
+      ok: false, 
+      status: 'failed',
+      phase: st.currentPhase,
+      error: 'Max retries exceeded'
+    };
     
   } else if (subagentStatus.status === 'running') {
-    console.log(`Subagent still running (${subagentStatus.runtime})`);
-    
-  } else if (subagentStatus.status === 'not_found') {
-    console.log('Subagent not found - may have completed or failed.');
-    // Consider it done and advance
-    state.advancePhase(st);
-  }
-}
-
-/**
- * Pause workflow
- */
-function pauseWorkflow() {
-  const st = state.loadState();
-  if (!st) {
-    console.log('No active workflow found.');
-    return;
+    return { 
+      ok: true, 
+      status: 'running',
+      phase: st.currentPhase,
+      phaseName: phaseConfig?.name
+    };
   }
   
-  state.pauseState(st);
-  console.log('Workflow paused.');
+  // Unknown status (not_found, api_error, etc.)
+  return { 
+    ok: true, 
+    status: subagentStatus.status,
+    phase: st.currentPhase
+  };
 }
 
-/**
- * Resume workflow
- */
-function resumeWorkflow() {
-  const st = state.loadState();
-  if (!st) {
-    console.log('No paused workflow found.');
-    return;
-  }
-  
-  state.resumeState(st);
-  console.log('Workflow resumed.');
-  checkAndAdvance();
+// Run if called directly
+if (require.main === module) {
+  const result = checkAndAdvance();
+  console.log(JSON.stringify(result, null, 2));
 }
 
-/**
- * Cancel workflow
- */
-function cancelWorkflow() {
-  const st = state.loadState();
-  if (!st) {
-    console.log('No active workflow found.');
-    return;
-  }
-  
-  state.cancelState(st);
-  console.log('Workflow cancelled.');
-}
-
-// Main command handler
-const command = process.argv[2];
-const projectName = process.argv.slice(3).join(' ');
-
-switch (command) {
-  case 'start':
-    if (!projectName) {
-      console.log('Usage: node orchestrator.js start <projectName>');
-      process.exit(1);
-    }
-    startWorkflow(projectName);
-    break;
-    
-  case 'status':
-    showStatus();
-    break;
-    
-  case 'check':
-    checkAndAdvance();
-    break;
-    
-  case 'pause':
-    pauseWorkflow();
-    break;
-    
-  case 'resume':
-    resumeWorkflow();
-    break;
-    
-  case 'cancel':
-    cancelWorkflow();
-    break;
-    
-  default:
-    console.log('Usage: node orchestrator.js <command> [args]');
-    console.log('\nCommands:');
-    console.log('  start <project>  Start new workflow');
-    console.log('  status           Show workflow status');
-    console.log('  check            Check and advance workflow');
-    console.log('  pause            Pause workflow');
-    console.log('  resume           Resume workflow');
-    console.log('  cancel           Cancel workflow');
-    process.exit(1);
-}
+module.exports = { checkAndAdvance };

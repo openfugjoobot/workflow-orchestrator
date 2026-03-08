@@ -1,0 +1,18 @@
+{
+  "projectId": "workflow-weather-dashboard-1772837670927",
+  "projectName": "Weather Dashboard",
+  "status": "running",
+  "currentPhase": 0,
+  "completedPhases": [],
+  "activeSubagent": null,
+  "subagentRunId": null,
+  "startedAt": "2026-03-06T22:54:30.926Z",
+  "lastUpdate": "2026-03-06T22:54:30.927Z",
+  "artifacts": {},
+  "errors": [],
+  "config": {
+    "heartbeatInterval": 30000,
+    "maxRetries": 2,
+    "baseTimeout": 120000
+  }
+}
